@@ -266,6 +266,23 @@
           <button class="btn" style="margin-top:14px;width:100%" data-action="save-settings">Enregistrer les paramètres</button>
         </div>
         <div class="card">
+          <h3>Synchronisation GitHub</h3>
+          <div class="note" id="syncStatus">Non configurée.</div>
+          <div class="field"><label for="ghRepo">Dépôt privé de données (utilisateur/dépôt)</label>
+            <input id="ghRepo" placeholder="jonathanch87/mariage-donnees" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off"></div>
+          <div class="field"><label for="ghPath">Fichier dans le dépôt</label>
+            <input id="ghPath" placeholder="budget.json" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off"></div>
+          <div class="field"><label for="ghToken">Jeton d’accès</label>
+            <input id="ghToken" type="password" placeholder="github_pat_…" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off"></div>
+          <div class="toolbar">
+            <button class="btn" data-action="sync-connect">Connecter</button>
+            <button class="btn secondary" data-action="sync-now">Synchroniser</button>
+          </div>
+          <button class="btn secondary small" style="margin-top:8px;width:100%" data-action="sync-forget">Oublier ce jeton</button>
+          <div class="note">Le jeton reste sur cet iPhone : il n’est ni publié dans le dépôt, ni inclus dans un export.
+            Le dépôt de données doit être <strong>privé</strong>, sinon votre budget serait lisible par tous.</div>
+        </div>
+        <div class="card">
           <h3>Sauvegarde</h3>
           <div class="note" id="storageNote"></div>
           <div class="toolbar" style="margin-top:12px">
@@ -575,6 +592,7 @@ function persist(){
     saveTimer = setTimeout(async () => {
       await Store.write(clone(state));
       flashSaved();
+      syncSoon();
       const r = savePending; savePending = null;
       if (r) r(true);
     }, 220);
@@ -1075,6 +1093,178 @@ async function toggleUnscheduled(){
 }
 
 /* ============================================================
+   Synchronisation GitHub
+   Les données vont dans un dépôt privé, via l'API Contents.
+   Le jeton est stocké à part : jamais dans l'état exporté.
+   ============================================================ */
+const GH_KEY = 'mariageBudget.github';
+const gh = { repo:'', path:'budget.json', branch:'', token:'', sha:null, lastSync:0 };
+let syncTimer = null, syncBusy = false, syncPending = false, syncError = '';
+
+const ghReady = () => !!(gh.repo && gh.token && gh.path);
+
+function ghLoad(){
+  try {
+    const raw = localStorage.getItem(GH_KEY);
+    if (raw) Object.assign(gh, JSON.parse(raw));
+  } catch(e){}
+}
+function ghSave(){
+  try { localStorage.setItem(GH_KEY, JSON.stringify(gh)); } catch(e){}
+}
+function b64enc(str){
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+function b64dec(b64){
+  const bin = atob(String(b64).replace(/\s/g, ''));
+  const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+async function ghApi(path, opts){
+  opts = opts || {};
+  const headers = {
+    'Authorization': 'Bearer ' + gh.token,
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28'
+  };
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  return fetch('https://api.github.com' + path, { method: opts.method || 'GET', headers, body: opts.body, keepalive: !!opts.keepalive });
+}
+async function ghMessage(r){
+  let detail = '';
+  try { const j = await r.json(); detail = j && j.message ? j.message : ''; } catch(e){}
+  if (r.status === 401) return 'Jeton refusé : il est invalide ou expiré.';
+  if (r.status === 403) return 'Accès refusé : le jeton n’a pas le droit « Contents : lecture et écriture ».';
+  if (r.status === 404) return 'Dépôt ou fichier introuvable, ou jeton sans accès à ce dépôt.';
+  if (r.status === 409) return 'Conflit de version sur le dépôt.';
+  return 'Erreur GitHub ' + r.status + (detail ? ' — ' + detail : '');
+}
+const ghUrl = () => '/repos/' + gh.repo + '/contents/' + gh.path.split('/').map(encodeURIComponent).join('/');
+
+async function ghPull(){
+  const r = await ghApi(ghUrl() + (gh.branch ? '?ref=' + encodeURIComponent(gh.branch) : ''));
+  if (r.status === 404) { gh.sha = null; return null; }
+  if (!r.ok) throw new Error(await ghMessage(r));
+  const j = await r.json();
+  gh.sha = j.sha || null;
+  if (!j.content) return null;
+  return JSON.parse(b64dec(j.content));
+}
+async function ghPush(keepalive){
+  const payload = {
+    message: 'Budget mariage — ' + new Intl.DateTimeFormat('fr-FR', { dateStyle:'short', timeStyle:'short' }).format(new Date()),
+    content: b64enc(JSON.stringify(state, null, 2))
+  };
+  if (gh.sha) payload.sha = gh.sha;
+  if (gh.branch) payload.branch = gh.branch;
+  let r = await ghApi(ghUrl(), { method:'PUT', body: JSON.stringify(payload), keepalive });
+  if (r.status === 409 || r.status === 422) {      // empreinte périmée : on relit puis on repousse
+    await ghPull();
+    if (gh.sha) payload.sha = gh.sha; else delete payload.sha;
+    r = await ghApi(ghUrl(), { method:'PUT', body: JSON.stringify(payload) });
+  }
+  if (!r.ok) throw new Error(await ghMessage(r));
+  const j = await r.json();
+  gh.sha = (j.content && j.content.sha) || null;
+  gh.lastSync = Date.now();
+  ghSave();
+}
+
+function syncSoon(){
+  if (!ghReady()) return;
+  syncPending = true;
+  renderSync();
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => syncNow(false), 1200);
+}
+async function syncNow(manual){
+  if (!ghReady()) { if (manual) toast('Renseignez d’abord le dépôt et le jeton'); return; }
+  if (syncBusy) { syncPending = true; return; }
+  if (typeof navigator.onLine === 'boolean' && !navigator.onLine) { syncPending = true; renderSync(); return; }
+  syncBusy = true; syncError = ''; renderSync();
+  try {
+    await ghPush(false);
+    syncPending = false;
+    if (manual) toast('Envoyé sur GitHub');
+  } catch(e){
+    syncError = e.message || 'Échec de la synchronisation';
+    syncPending = true;
+    if (manual) toast(syncError);
+  } finally {
+    syncBusy = false; renderSync();
+  }
+}
+
+function renderSync(){
+  const el = $('syncStatus');
+  if (!el) return;
+  if (syncError) { el.innerHTML = '<strong style="color:var(--danger)">' + esc(syncError) + '</strong>'; return; }
+  if (!ghReady()) { el.textContent = 'Non configurée. Les données restent sur cet appareil.'; return; }
+  if (syncBusy) { el.textContent = 'Envoi en cours…'; return; }
+  if (syncPending) { el.textContent = 'Modifications en attente d’envoi.'; return; }
+  el.textContent = gh.lastSync
+    ? 'À jour sur ' + esc(gh.repo) + ' — dernier envoi ' + new Intl.DateTimeFormat('fr-FR', { dateStyle:'short', timeStyle:'short' }).format(new Date(gh.lastSync)) + '.'
+    : 'Connecté à ' + esc(gh.repo) + '.';
+}
+function syncFillInputs(){
+  if ($('ghRepo')) $('ghRepo').value = gh.repo;
+  if ($('ghPath')) $('ghPath').value = gh.path;
+  if ($('ghToken')) $('ghToken').value = gh.token ? '••••••••••••' : '';
+}
+
+async function syncConnect(){
+  const repo = $('ghRepo').value.trim().replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, '').replace(/\/+$/, '');
+  const path = $('ghPath').value.trim().replace(/^\/+/, '') || 'budget.json';
+  const tokenField = $('ghToken').value.trim();
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) { toast('Format attendu : utilisateur/dépôt'); return; }
+  if (!/^\.?[\w.\-\/]+\.json$/.test(path)) { toast('Le fichier doit se terminer par .json'); return; }
+  const token = /^•+$/.test(tokenField) ? gh.token : tokenField;
+  if (!token) { toast('Collez votre jeton d’accès'); return; }
+
+  const before = { repo: gh.repo, path: gh.path, token: gh.token, sha: gh.sha };
+  Object.assign(gh, { repo, path, token, sha: null });
+  syncBusy = true; syncError = ''; renderSync();
+  try {
+    const remote = await ghPull();
+    syncBusy = false;
+    if (remote && Array.isArray(remote.expenses) && num(remote.savedAt) > num(state.savedAt)) {
+      if (await askConfirm('Le dépôt contient une version plus récente. L’utiliser à la place des données de cet appareil ?', 'Utiliser celle du dépôt')) {
+        state = normalize(remote);
+        await Store.write(clone(state));
+        syncSettingsInputs(); renderAll();
+        gh.lastSync = Date.now(); ghSave(); renderSync(); syncFillInputs();
+        toast('Données récupérées depuis GitHub');
+        return;
+      }
+    }
+    await syncNow(false);
+    ghSave(); syncFillInputs();
+    toast(syncError ? syncError : 'Synchronisation activée');
+  } catch(e){
+    syncBusy = false;
+    Object.assign(gh, before);
+    syncError = e.message || 'Connexion impossible';
+    renderSync();
+    toast(syncError);
+  }
+}
+async function syncForget(){
+  if (!await askConfirm('Retirer le jeton et couper la synchronisation ? Le fichier déjà envoyé reste sur GitHub.', 'Oublier')) return;
+  Object.assign(gh, { repo:'', path:'budget.json', branch:'', token:'', sha:null, lastSync:0 });
+  try { localStorage.removeItem(GH_KEY); } catch(e){}
+  syncPending = false; syncError = '';
+  syncFillInputs(); renderSync();
+  toast('Jeton oublié');
+}
+
+window.addEventListener('online', () => { if (syncPending) syncNow(false); });
+window.addEventListener('offline', renderSync);
+
+/* ============================================================
    Import / export
    ============================================================ */
 async function saveFile(filename, content, mime){
@@ -1115,6 +1305,10 @@ function buildAppHtml(){
   const pt = clean.querySelector('#pageTitle'); if (pt) pt.textContent = titles.home[0];
   const ps = clean.querySelector('#pageSub'); if (ps) ps.textContent = titles.home[1];
   const sf = clean.querySelector('#saveFlag'); if (sf) sf.className = 'saveflag';
+  ['ghRepo','ghPath','ghToken'].forEach(id => {
+    const n = clean.querySelector('#' + id);
+    if (n) { n.removeAttribute('value'); n.value = ''; }
+  });
   const seed = clean.querySelector('#seedData');
   if (seed) seed.textContent = JSON.stringify(state).replace(/</g, '\\u003c');
   return '<!doctype html>\n' + clean.outerHTML;
@@ -1197,6 +1391,9 @@ document.addEventListener('click', async e => {
     case 'export-app': await exportApp(); break;
     case 'import-json': $('importFile').click(); break;
     case 'reset': await resetApp(); break;
+    case 'sync-connect': await syncConnect(); break;
+    case 'sync-now': await syncNow(true); break;
+    case 'sync-forget': await syncForget(); break;
   }
 });
 
@@ -1226,7 +1423,9 @@ window.addEventListener('scroll', () => {
   $('appHeader').classList.toggle('scrolled', window.scrollY > 6);
 }, { passive: true });
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden' && saveTimer) { clearTimeout(saveTimer); Store.write(clone(state)); }
+  if (document.visibilityState !== 'hidden') return;
+  if (saveTimer) { clearTimeout(saveTimer); Store.write(clone(state)); }
+  if (syncPending && ghReady() && !syncBusy) { clearTimeout(syncTimer); ghPush(true).catch(() => {}); }
 });
 
 /* ============================================================
@@ -1271,6 +1470,22 @@ function updateStorageUI(){
   updateStorageUI();
   syncSettingsInputs();
   renderAll();
+
+  ghLoad(); syncFillInputs(); renderSync();
+  if (ghReady()) {
+    try {
+      const remote = await ghPull();
+      if (remote && Array.isArray(remote.expenses) && num(remote.savedAt) > num(state.savedAt)) {
+        state = normalize(remote);
+        await Store.write(clone(state));
+        syncSettingsInputs(); renderAll();
+        gh.lastSync = Date.now(); ghSave();
+      } else if (remote === null || num(state.savedAt) > num(remote.savedAt)) {
+        syncSoon();
+      }
+      renderSync();
+    } catch(e){ syncError = e.message || 'Synchronisation indisponible'; renderSync(); }
+  }
   if (seed && chosen === seed && storageMode !== 'memory') persist();
 })();
 </script>
